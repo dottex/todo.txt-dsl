@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# capture — todo.sh addon
+# Add a new task with an automatically allocated id: key in one atomic step.
+#
+# Usage:
+#   todo.sh capture "<task text>"
+#   todo.sh capture usage
+#
+# The task text follows todo.txt format.  A creation date is prepended when
+# DATE_ON_ADD=1 is set in todo.cfg (mirrors todo.sh's native behaviour).
+#
+# If $TODO_FILE is inside the logbook list directory, a new row is written to
+# .sync/map.tsv with state=new so the next sync push creates it remotely.
+#
+# Exit codes:
+#   0  — success
+#   1  — usage error or write failure
+#   2  — id allocation failure (lock timeout)
+#
+# [ADDON] — place this file in $TODO_ACTIONS_DIR and make it executable.
+
+set -euo pipefail
+
+ACTION=${1:-}; shift || true
+
+usage() {
+    cat <<EOF
+  capture "<task text>"
+    Add a task to \$TODO_FILE with an auto-allocated id: key.
+    Follows the todo.txt spec: priority (A)-(Z) must precede the text;
+    creation date is prepended when DATE_ON_ADD=1.
+
+    Examples:
+      todo.sh capture "Write spec draft due:2026-08-15 s:next"
+      todo.sh capture "(A) Review PR due:2026-08-10 star:1"
+EOF
+}
+
+[ "$ACTION" = "usage" ] && { usage; exit 0; }
+
+# Reassemble full task text from ACTION + remaining args
+# (supports both quoted single-arg and unquoted multi-word invocation)
+if [ $# -gt 0 ]; then
+    TASK_TEXT="$ACTION $*"
+else
+    TASK_TEXT="$ACTION"
+fi
+
+if [ -z "$TASK_TEXT" ]; then
+    echo "capture: no task text provided" >&2
+    usage >&2
+    exit 1
+fi
+
+# Validate: task text must not already contain id:
+if echo "$TASK_TEXT" | grep -qE '(^| )id:[0-9]+'; then
+    echo "capture: task text already contains id: — use 'todo.sh add' to append manually" >&2
+    exit 1
+fi
+
+: "${TODO_DIR:=$HOME/.todo}"
+: "${TODO_FILE:=$TODO_DIR/todo.txt}"
+: "${DATE_ON_ADD:=0}"
+
+# Locate the global .idseq counter
+IDSEQ_FILE="$HOME/.todo/.idseq"
+[ -f "$TODO_DIR/../.idseq" ] && IDSEQ_FILE="$TODO_DIR/../.idseq"
+[ -f "$HOME/.todo/.idseq" ] && IDSEQ_FILE="$HOME/.todo/.idseq"
+
+# Create .idseq if it does not exist
+if [ ! -f "$IDSEQ_FILE" ]; then
+    mkdir -p "$(dirname "$IDSEQ_FILE")"
+    echo "0" > "$IDSEQ_FILE"
+fi
+
+if [ ! -w "$(dirname "$TODO_FILE")" ] && [ ! -f "$TODO_FILE" ]; then
+    echo "capture: cannot create $TODO_FILE (directory not writable)" >&2
+    exit 1
+fi
+if [ -f "$TODO_FILE" ] && [ ! -w "$TODO_FILE" ]; then
+    echo "capture: $TODO_FILE is not writable" >&2
+    exit 1
+fi
+
+# Allocate next id atomically
+NEW_ID=$(flock -w 30 "$IDSEQ_FILE" sh -c \
+    'n=$(cat "'"$IDSEQ_FILE"'"); n=$((n+1)); printf "%d\n" "$n" > "'"$IDSEQ_FILE"'"; printf "%d\n" "$n"' \
+    2>/dev/null) || {
+    echo "capture: could not acquire lock on $IDSEQ_FILE (timeout)" >&2
+    exit 2
+}
+
+# Build final task line
+if [ "$DATE_ON_ADD" = "1" ]; then
+    TODAY=$(date +%F)
+    # Insert creation date after optional priority field
+    # Priority pattern: (A) at the start of TASK_TEXT
+    if echo "$TASK_TEXT" | grep -qE '^\([A-Z]\) '; then
+        PRI=$(echo "$TASK_TEXT" | cut -d' ' -f1)
+        REST=$(echo "$TASK_TEXT" | cut -d' ' -f2-)
+        TASK_LINE="${PRI} ${TODAY} ${REST} id:${NEW_ID}"
+    else
+        TASK_LINE="${TODAY} ${TASK_TEXT} id:${NEW_ID}"
+    fi
+else
+    TASK_LINE="${TASK_TEXT} id:${NEW_ID}"
+fi
+
+# Append to $TODO_FILE
+printf '%s\n' "$TASK_LINE" >> "$TODO_FILE"
+echo "capture: added task id:${NEW_ID}"
+echo "$TASK_LINE"
+
+# If $TODO_FILE is inside the logbook directory, mark in map.tsv
+LOGBOOK_DIR="$(dirname "$TODO_FILE")"
+MAP_FILE="$LOGBOOK_DIR/.sync/map.tsv"
+
+# Check if this is the synced logbook list
+LIST_META="$LOGBOOK_DIR/.list-meta"
+if [ -f "$LIST_META" ] && [ -d "$LOGBOOK_DIR/.sync" ]; then
+    mkdir -p "$(dirname "$MAP_FILE")"
+    CANONICAL=$(canonical_hash "$TASK_LINE")
+    printf '%s\t%s\t%s\t%s\n' "$NEW_ID" "" "$CANONICAL" "new" >> "$MAP_FILE"
+fi
+
+exit 0
+
+# ---------------------------------------------------------------------------
+# Canonical hash helper (SPEC §3.2)
+# Strips id: and star: tokens, normalises whitespace, sorts key:value tokens,
+# then hashes with md5sum.
+# ---------------------------------------------------------------------------
+canonical_hash() {
+    local line="$1"
+    # Strip id: and star: tokens
+    line=$(printf '%s' "$line" | sed 's/ id:[0-9][0-9]*//g; s/ star:[0-9]*//g')
+    # Normalise whitespace
+    line=$(printf '%s' "$line" | tr -s ' ' | sed 's/^ //; s/ $//')
+    printf '%s' "$line" | md5sum | cut -d' ' -f1
+}

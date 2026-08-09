@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# resolve — todo.sh addon
+# Find a task line by its id: key.  Searches todo.txt and done.txt in every
+# list directory under $TODO_DIR.
+#
+# Usage:  todo.sh resolve <id>
+#         todo.sh resolve usage
+#
+# Exit codes:
+#   0  — exactly one match found
+#   1  — no match found, or usage error
+#   2  — duplicate id: values found (multiple matches)
+#
+# [ADDON] — place this file in $TODO_ACTIONS_DIR and make it executable.
+
+set -euo pipefail
+
+ACTION=${1:-}; shift || true
+
+usage() {
+    cat <<EOF
+  resolve <id>
+    Find the task with id:<id> in todo.txt and done.txt across all list
+    directories under \$TODO_DIR.  Reports file path, line number, and
+    the full task line.  Searches done.txt so that archived parents of
+    p: links are always locatable.
+
+    Exit 0: exactly one match.
+    Exit 1: no match.
+    Exit 2: duplicate id: values (multiple matches — run lint to repair).
+EOF
+}
+
+[ "$ACTION" = "usage" ] && { usage; exit 0; }
+
+# Validate argument
+if [ -z "$ACTION" ] || ! echo "$ACTION" | grep -qE '^[0-9]+$'; then
+    echo "error: resolve requires a numeric id argument" >&2
+    usage >&2
+    exit 1
+fi
+
+TARGET_ID="$ACTION"
+
+# Determine search root.  todo.sh sets $TODO_DIR; fall back to default.
+: "${TODO_DIR:=$HOME/.todo}"
+
+# Collect all todo.txt and done.txt files under $TODO_DIR.
+# Use find with -maxdepth 2 to cover <list>/todo.txt and <list>/done.txt.
+mapfile -t FILES < <(find "$TODO_DIR" -maxdepth 2 \( -name 'todo.txt' -o -name 'done.txt' \) 2>/dev/null | sort)
+
+if [ ${#FILES[@]} -eq 0 ]; then
+    echo "error: no todo.txt or done.txt files found under $TODO_DIR" >&2
+    exit 1
+fi
+
+MATCHES=()
+
+for FILE in "${FILES[@]}"; do
+    [ -r "$FILE" ] || continue
+    LNUM=0
+    while IFS= read -r LINE || [ -n "$LINE" ]; do
+        LNUM=$((LNUM + 1))
+        # Match id:<TARGET_ID> as a whole token (space-delimited or end-of-line)
+        if echo "$LINE" | grep -qE "(^| )id:${TARGET_ID}( |$)"; then
+            MATCHES+=("${FILE}:${LNUM}: ${LINE}")
+        fi
+    done < "$FILE"
+done
+
+COUNT=${#MATCHES[@]}
+
+if [ "$COUNT" -eq 0 ]; then
+    echo "resolve: id:${TARGET_ID} not found" >&2
+    exit 1
+fi
+
+for MATCH in "${MATCHES[@]}"; do
+    echo "$MATCH"
+done
+
+if [ "$COUNT" -gt 1 ]; then
+    echo "resolve: warning: id:${TARGET_ID} found $COUNT times — run 'todo.sh lint' to repair duplicates" >&2
+    exit 2
+fi
+
+exit 0

@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# lint — todo.sh addon
+# Validate and repair todo.txt and done.txt files.
+#
+# Actions performed (all lists are read; only the current list is written
+# unless --all is given):
+#   • Backfill missing id: keys from ~/.todo/.idseq  (requires --fix)
+#   • Report duplicate id: values across all files
+#   • Flag p: references whose target id: is not found in any file (orphans)
+#   • Flag p: references where the parent lives in a different list file
+#   • GC orphan map.tsv rows: rows whose local id: is absent from the list dir
+#   • Report conflict files in logbook/conflicts/ (informational)
+#
+# Usage:
+#   todo.sh lint [--fix] [--orphans] [--all] [--map]
+#
+# Flags:
+#   --fix      Rewrite lines to backfill missing id: and repair duplicate id:
+#   --orphans  Also report/strip dangling p: keys (requires --fix to strip)
+#   --all      Operate on all list directories under $TODO_DIR
+#   --map      Also GC orphan rows from logbook/map.tsv
+#
+# Exit codes:
+#   0  — no issues found (or all issues fixed)
+#   1  — issues found that require attention
+#   2  — fatal error (permission denied, lock timeout, etc.)
+#
+# [ADDON] — place this file in $TODO_ACTIONS_DIR and make it executable.
+
+set -euo pipefail
+
+ACTION=${1:-}; shift || true
+
+usage() {
+    cat <<EOF
+  lint [--fix] [--orphans] [--all] [--map]
+    Validate and repair todo.txt / done.txt files.
+
+    --fix      Backfill missing id: keys; reassign duplicate id: values.
+               Requires write access to the file and to ~/.todo/.idseq.
+    --orphans  Report p: links whose target id: cannot be resolved.
+               With --fix, removes the dangling p: key from the line.
+    --all      Scan all list directories under \$TODO_DIR instead of only
+               the current \$TODO_FILE directory.
+    --map      GC orphan rows from logbook/.sync/map.tsv (rows with no
+               matching local id:).
+EOF
+}
+
+[ "$ACTION" = "usage" ] && { usage; exit 0; }
+
+# Parse flags from remaining args
+OPT_FIX=0
+OPT_ORPHANS=0
+OPT_ALL=0
+OPT_MAP=0
+
+for ARG in "$ACTION" "$@"; do
+    case "$ARG" in
+        --fix)     OPT_FIX=1 ;;
+        --orphans) OPT_ORPHANS=1 ;;
+        --all)     OPT_ALL=1 ;;
+        --map)     OPT_MAP=1 ;;
+        usage)     usage; exit 0 ;;
+        *)         ;;
+    esac
+done
+
+: "${TODO_DIR:=$HOME/.todo}"
+: "${TODO_FILE:=$TODO_DIR/todo.txt}"
+: "${DONE_FILE:=$TODO_DIR/done.txt}"
+
+IDSEQ_FILE="$HOME/.todo/.idseq"
+# Prefer $TODO_DIR/../.idseq (list-parent location) over global $HOME/.todo/.idseq
+[ -f "$TODO_DIR/../.idseq" ] && IDSEQ_FILE="$TODO_DIR/../.idseq"
+[ -f "$HOME/.todo/.idseq" ] && IDSEQ_FILE="$HOME/.todo/.idseq"
+
+ISSUES=0
+
+log_info()  { echo "INFO  $*"; }
+log_warn()  { echo "WARN  $*"; ISSUES=1; }
+log_error() { echo "ERROR $*" >&2; ISSUES=1; }
+
+# Determine which files to scan
+if [ "$OPT_ALL" -eq 1 ]; then
+    mapfile -t SCAN_FILES < <(find "$TODO_DIR" -maxdepth 2 \( -name 'todo.txt' -o -name 'done.txt' \) 2>/dev/null | sort)
+else
+    SCAN_FILES=()
+    [ -f "$TODO_FILE" ] && SCAN_FILES+=("$TODO_FILE")
+    [ -f "$DONE_FILE" ] && SCAN_FILES+=("$DONE_FILE")
+fi
+
+if [ ${#SCAN_FILES[@]} -eq 0 ]; then
+    echo "lint: no files to scan" >&2
+    exit 0
+fi
+
+# Pass 1: collect all id: values across all scanned files
+declare -A ID_FILE   # id -> "file:lineno"
+declare -A ID_DUPE   # id -> 1 if duplicate
+
+for FILE in "${SCAN_FILES[@]}"; do
+    [ -r "$FILE" ] || continue
+    LNUM=0
+    while IFS= read -r LINE || [ -n "$LINE" ]; do
+        LNUM=$((LNUM + 1))
+        # Extract id: token
+        ID=$(echo "$LINE" | grep -oE '(^| )id:[0-9]+' | grep -oE '[0-9]+' | head -1)
+        if [ -n "$ID" ]; then
+            if [ -n "${ID_FILE[$ID]+x}" ]; then
+                ID_DUPE[$ID]=1
+                log_warn "duplicate id:$ID — ${FILE}:${LNUM} and ${ID_FILE[$ID]}"
+            else
+                ID_FILE[$ID]="${FILE}:${LNUM}"
+            fi
+        fi
+    done < "$FILE"
+done
+
+# Pass 2: backfill missing id:, report duplicates, check p: orphans
+# Only rewrite the current-list files (not done.txt of other lists)
+WRITE_FILES=()
+[ -f "$TODO_FILE" ] && WRITE_FILES+=("$TODO_FILE")
+
+for FILE in "${SCAN_FILES[@]}"; do
+    [ -r "$FILE" ] || continue
+    LNUM=0
+    TMPFILE=$(mktemp)
+    CHANGED=0
+
+    while IFS= read -r LINE || [ -n "$LINE" ]; do
+        LNUM=$((LNUM + 1))
+
+        # Skip blank lines
+        if [ -z "$LINE" ]; then
+            echo "" >> "$TMPFILE"
+            continue
+        fi
+
+        # Check for missing id:
+        HAS_ID=$(echo "$LINE" | grep -cE '(^| )id:[0-9]+' || true)
+        if [ "$HAS_ID" -eq 0 ]; then
+            if [ "$OPT_FIX" -eq 1 ] && [[ " ${WRITE_FILES[*]} " == *" $FILE "* ]]; then
+                # Allocate next id
+                NEW_ID=$(flock -w 30 "$IDSEQ_FILE" sh -c \
+                    'n=$(cat "'"$IDSEQ_FILE"'"); n=$((n+1)); echo $n > "'"$IDSEQ_FILE"'"; echo $n' 2>/dev/null) || {
+                    log_error "could not lock $IDSEQ_FILE — is flock available?"
+                    rm -f "$TMPFILE"
+                    exit 2
+                }
+                LINE="${LINE} id:${NEW_ID}"
+                ID_FILE[$NEW_ID]="${FILE}:${LNUM}"
+                CHANGED=1
+                log_info "backfilled id:${NEW_ID} on ${FILE}:${LNUM}"
+            else
+                log_warn "missing id: on ${FILE}:${LNUM}: $LINE"
+            fi
+        fi
+
+        # Check for duplicate id: and reassign if --fix
+        ID=$(echo "$LINE" | grep -oE '(^| )id:[0-9]+' | grep -oE '[0-9]+' | head -1)
+        if [ -n "$ID" ] && [ -n "${ID_DUPE[$ID]+x}" ]; then
+            FIRST_LOC="${ID_FILE[$ID]}"
+            if [ "${FIRST_LOC%%:*}" != "$FILE" ] || [ "${FIRST_LOC##*:}" -lt "$LNUM" ]; then
+                # This is a later occurrence — reassign
+                if [ "$OPT_FIX" -eq 1 ] && [[ " ${WRITE_FILES[*]} " == *" $FILE "* ]]; then
+                    NEW_ID=$(flock -w 30 "$IDSEQ_FILE" sh -c \
+                        'n=$(cat "'"$IDSEQ_FILE"'"); n=$((n+1)); echo $n > "'"$IDSEQ_FILE"'"; echo $n' 2>/dev/null) || {
+                        log_error "could not lock $IDSEQ_FILE"
+                        rm -f "$TMPFILE"
+                        exit 2
+                    }
+                    LINE=$(echo "$LINE" | sed "s/ id:${ID}\b/ id:${NEW_ID}/")
+                    ID_FILE[$NEW_ID]="${FILE}:${LNUM}"
+                    CHANGED=1
+                    log_info "reassigned duplicate id:${ID} → id:${NEW_ID} on ${FILE}:${LNUM}"
+                else
+                    log_warn "duplicate id:${ID} later occurrence at ${FILE}:${LNUM}"
+                fi
+            fi
+        fi
+
+        # Check p: orphans
+        if [ "$OPT_ORPHANS" -eq 1 ]; then
+            PARENT_ID=$(echo "$LINE" | grep -oE '(^| )p:[0-9]+' | grep -oE '[0-9]+' | head -1)
+            if [ -n "$PARENT_ID" ] && [ -z "${ID_FILE[$PARENT_ID]+x}" ]; then
+                if [ "$OPT_FIX" -eq 1 ] && [[ " ${WRITE_FILES[*]} " == *" $FILE "* ]]; then
+                    LINE=$(echo "$LINE" | sed "s/ p:${PARENT_ID}\b//")
+                    CHANGED=1
+                    log_warn "removed dangling p:${PARENT_ID} on ${FILE}:${LNUM}"
+                else
+                    log_warn "p:${PARENT_ID} not found in any file (${FILE}:${LNUM}: $LINE)"
+                fi
+            fi
+        fi
+
+        echo "$LINE" >> "$TMPFILE"
+    done < "$FILE"
+
+    if [ "$OPT_FIX" -eq 1 ] && [ "$CHANGED" -eq 1 ] && [[ " ${WRITE_FILES[*]} " == *" $FILE "* ]]; then
+        cp "$FILE" "${FILE}.bak"
+        mv "$TMPFILE" "$FILE"
+        log_info "wrote updated ${FILE} (backup at ${FILE}.bak)"
+    else
+        rm -f "$TMPFILE"
+    fi
+done
+
+# Pass 3: GC orphan map.tsv rows
+if [ "$OPT_MAP" -eq 1 ]; then
+    MAP_FILE="$TODO_DIR/.sync/map.tsv"
+    if [ -f "$MAP_FILE" ]; then
+        TMPMAP=$(mktemp)
+        GC_COUNT=0
+        while IFS=$'\t' read -r LOCAL_ID MSFT_ID LAST_HASH STATE REST || [ -n "$LOCAL_ID" ]; do
+            [ -z "$LOCAL_ID" ] && continue
+            if [ -z "${ID_FILE[$LOCAL_ID]+x}" ]; then
+                log_warn "GC orphan map row: local id:${LOCAL_ID} not found in any file"
+                GC_COUNT=$((GC_COUNT + 1))
+            else
+                printf '%s\t%s\t%s\t%s\n' "$LOCAL_ID" "$MSFT_ID" "$LAST_HASH" "$STATE" >> "$TMPMAP"
+            fi
+        done < "$MAP_FILE"
+        if [ "$GC_COUNT" -gt 0 ] && [ "$OPT_FIX" -eq 1 ]; then
+            mv "$TMPMAP" "$MAP_FILE"
+            log_info "removed $GC_COUNT orphan rows from $MAP_FILE"
+        else
+            rm -f "$TMPMAP"
+        fi
+    fi
+fi
+
+# Report conflict files
+CONFLICT_DIR="$TODO_DIR/conflicts"
+if [ -d "$CONFLICT_DIR" ]; then
+    CONFLICT_COUNT=$(find "$CONFLICT_DIR" -name '*.txt' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$CONFLICT_COUNT" -gt 0 ]; then
+        log_warn "$CONFLICT_COUNT unresolved conflict file(s) in $CONFLICT_DIR"
+    fi
+fi
+
+[ "$ISSUES" -eq 0 ] && exit 0 || exit 1
