@@ -117,13 +117,13 @@ graph_api() {
     local BASE="https://graph.microsoft.com/v1.0/me/todo/lists/${MSFT_LIST_ID}"
     if [ -n "$BODY" ]; then
         curl -sS -X "$METHOD" \
-            -H "Authorization: ******" \
+            -H "Authorization: Bearer $MSFT_ACCESS_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$BODY" \
             "${BASE}${PATH_SUFFIX}"
     else
         curl -sS -X "$METHOD" \
-            -H "Authorization: ******" \
+            -H "Authorization: Bearer $MSFT_ACCESS_TOKEN" \
             "${BASE}${PATH_SUFFIX}"
     fi
 }
@@ -386,11 +386,12 @@ do_sync() {
 
     # Process synced tasks — hash comparison
     while IFS=$'\t' read -r LOCAL_ID MSFT_ID LAST_HASH STATE; do
-        [ -z "$LOCAL_ID" ] || [ "$STATE" = "new" ] && continue
+        [ -z "$LOCAL_ID" ] && continue
+        [ "$STATE" = "new" ] && continue
         LOCAL_LINE=$(grep -rh " id:${LOCAL_ID}\b" "$TODO_FILE" "$DONE_FILE" 2>/dev/null | head -1) || true
         [ -z "$LOCAL_LINE" ] && continue
         CURRENT_HASH=$(canonical_hash "$LOCAL_LINE")
-        REMOTE_TITLE="${DELTA_TASKS[$MSFT_ID]+x}"
+        REMOTE_TITLE="${DELTA_TASKS[$MSFT_ID]:-}"
 
         LOCAL_CHANGED=0
         REMOTE_CHANGED=0
@@ -398,11 +399,13 @@ do_sync() {
         [ -n "${DELTA_TASKS[$MSFT_ID]+x}" ] && REMOTE_CHANGED=1
 
         if [ "$LOCAL_CHANGED" -eq 1 ] && [ "$REMOTE_CHANGED" -eq 0 ]; then
+            [ "${PULL_ONLY:-0}" -eq 1 ] && continue
             BODY=$(build_patch_body "$LOCAL_LINE")
             graph_api PATCH "/tasks/$MSFT_ID" "$BODY" >/dev/null
             map_set "$LOCAL_ID" "$MSFT_ID" "$CURRENT_HASH" "synced"
             echo "pushed id:$LOCAL_ID"
         elif [ "$LOCAL_CHANGED" -eq 0 ] && [ "$REMOTE_CHANGED" -eq 1 ]; then
+            [ "${PUSH_ONLY:-0}" -eq 1 ] && continue
             echo "pull id:$LOCAL_ID — not yet implemented (update local line from remote title)"
         elif [ "$LOCAL_CHANGED" -eq 1 ] && [ "$REMOTE_CHANGED" -eq 1 ]; then
             # Conflict: local wins; save remote to conflicts/
@@ -425,11 +428,21 @@ do_sync() {
     echo "sync complete"
 }
 
+# do_push: only push local changes to the remote; skip pull pass
+do_push() {
+    PUSH_ONLY=1 do_sync
+}
+
+# do_pull: only pull remote changes into local files; skip push pass
+do_pull() {
+    PULL_ONLY=1 do_sync
+}
+
 # ── Sub-command dispatch ──────────────────────────────────────────────────────
 
 case "$SUB_CMD" in
-    push)   do_sync ;;
-    pull)   do_sync ;;
+    push)   do_push ;;
+    pull)   do_pull ;;
     status) do_status ;;
     "")     do_sync ;;
     *)      echo "sync: unknown sub-command '$SUB_CMD'" >&2; usage >&2; exit 1 ;;

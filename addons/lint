@@ -70,8 +70,8 @@ done
 : "${TODO_FILE:=$TODO_DIR/todo.txt}"
 : "${DONE_FILE:=$TODO_DIR/done.txt}"
 
-IDSEQ_FILE="$TODO_DIR/../.idseq"
-# Support both $TODO_DIR/.idseq (single-list) and $HOME/.todo/.idseq (global)
+IDSEQ_FILE="$HOME/.todo/.idseq"
+# Prefer $TODO_DIR/../.idseq (list-parent location) over global $HOME/.todo/.idseq
 [ -f "$TODO_DIR/../.idseq" ] && IDSEQ_FILE="$TODO_DIR/../.idseq"
 [ -f "$HOME/.todo/.idseq" ] && IDSEQ_FILE="$HOME/.todo/.idseq"
 
