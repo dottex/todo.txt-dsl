@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# sync — todo.sh addon
+# Synchronise the logbook list with Microsoft To Do via Graph API.
+#
+# Requires:
+#   - curl (POSIX coreutils + curl; no jq, no python)
+#   - ~/.config/todo-sync/credentials  (mode 0600)
+#   - $TODO_DIR must point to the logbook list directory
+#
+# Usage:
+#   todo.sh sync [push|pull|status]  [--dry-run] [--force-delete] [--max-delete=N]
+#   todo.sh sync usage
+#
+# Sub-commands:
+#   push    Push local changes to Microsoft To Do
+#   pull    Pull remote changes into local files
+#   (none)  Full bidirectional reconciliation (default)
+#   status  Show pending local and remote changes without making any
+#
+# Flags:
+#   --dry-run       Print all planned operations; make no changes; exit 0
+#   --force-delete  Override D10 deletion threshold
+#   --max-delete=N  Override SYNC_DELETE_ABSOLUTE for this run
+#
+# Secrets live at ~/.config/todo-sync/credentials (never under ~/.todo/).
+# See SPEC.md §3.6 for the required variables.
+#
+# Exit codes:
+#   0  — success (or dry-run completed)
+#   1  — error
+#   2  — D10 deletion threshold exceeded (re-run with --force-delete)
+#
+# [ADDON] — place this file in $TODO_ACTIONS_DIR and make it executable.
+
+set -euo pipefail
+
+ACTION=${1:-}; shift || true
+
+usage() {
+    cat <<EOF
+  sync [push|pull|status] [--dry-run] [--force-delete] [--max-delete=N]
+    Synchronise the logbook list with Microsoft To Do.
+    Credentials must be in ~/.config/todo-sync/credentials (mode 0600).
+    See SPEC.md for the full reconciliation algorithm and conflict policy.
+
+    push          Push local-only changes
+    pull          Pull remote-only changes
+    status        Show pending changes without modifying anything
+    (no sub-cmd)  Full bidirectional reconciliation
+
+    --dry-run       Show planned operations; make no changes
+    --force-delete  Override the D10 deletion safety threshold
+    --max-delete=N  Override SYNC_DELETE_ABSOLUTE for this run
+EOF
+}
+
+[ "$ACTION" = "usage" ] && { usage; exit 0; }
+
+# ── Parse flags ─────────────────────────────────────────────────────────────
+SUB_CMD="$ACTION"
+DRY_RUN=0
+FORCE_DELETE=0
+MAX_DELETE_OVERRIDE=""
+
+for ARG in "$@"; do
+    case "$ARG" in
+        --dry-run)       DRY_RUN=1 ;;
+        --force-delete)  FORCE_DELETE=1 ;;
+        --max-delete=*)  MAX_DELETE_OVERRIDE="${ARG#--max-delete=}" ;;
+        push|pull|status) SUB_CMD="$ARG" ;;
+        *) ;;
+    esac
+done
+
+# ── Directories ──────────────────────────────────────────────────────────────
+: "${TODO_DIR:=$HOME/.todo/logbook}"
+: "${TODO_FILE:=$TODO_DIR/todo.txt}"
+: "${DONE_FILE:=$TODO_DIR/done.txt}"
+
+MAP_FILE="$TODO_DIR/.sync/map.tsv"
+LIST_META="$TODO_DIR/.list-meta"
+DELTA_FILE="$TODO_DIR/.sync/delta.link"
+CONFLICT_DIR="$TODO_DIR/conflicts"
+
+CRED_FILE="${HOME}/.config/todo-sync/credentials"
+
+# ── Credential check ─────────────────────────────────────────────────────────
+if [ ! -f "$CRED_FILE" ]; then
+    echo "sync: credentials file not found: $CRED_FILE" >&2
+    echo "      Create it with mode 0600 — see SPEC.md §3.6" >&2
+    exit 1
+fi
+
+CRED_MODE=$(stat -c '%a' "$CRED_FILE" 2>/dev/null || stat -f '%Lp' "$CRED_FILE" 2>/dev/null || echo "???")
+if [ "$CRED_MODE" != "600" ]; then
+    echo "sync: $CRED_FILE has mode $CRED_MODE; must be 0600" >&2
+    echo "      Run: chmod 600 $CRED_FILE" >&2
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+. "$CRED_FILE"
+
+: "${MSFT_ACCESS_TOKEN:?sync: MSFT_ACCESS_TOKEN not set in $CRED_FILE}"
+: "${MSFT_LIST_ID:?sync: MSFT_LIST_ID not set in $CRED_FILE}"
+
+# ── Thresholds (D10) ─────────────────────────────────────────────────────────
+: "${SYNC_DELETE_ABSOLUTE:=10}"
+: "${SYNC_DELETE_FRACTION:=0.20}"
+[ -n "$MAX_DELETE_OVERRIDE" ] && SYNC_DELETE_ABSOLUTE="$MAX_DELETE_OVERRIDE"
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+graph_api() {
+    # graph_api <method> <path> [body]
+    local METHOD="$1" PATH_SUFFIX="$2" BODY="${3:-}"
+    local BASE="https://graph.microsoft.com/v1.0/me/todo/lists/${MSFT_LIST_ID}"
+    if [ -n "$BODY" ]; then
+        curl -sS -X "$METHOD" \
+            -H "Authorization: ******" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "${BASE}${PATH_SUFFIX}"
+    else
+        curl -sS -X "$METHOD" \
+            -H "Authorization: ******" \
+            "${BASE}${PATH_SUFFIX}"
+    fi
+}
+
+canonical_hash() {
+    local line="$1"
+    line=$(printf '%s' "$line" | sed 's/ id:[0-9][0-9]*//g; s/ star:[0-9]*//g')
+    line=$(printf '%s' "$line" | tr -s ' ' | sed 's/^ //; s/ $//')
+    printf '%s' "$line" | md5sum | cut -d' ' -f1
+}
+
+line_to_title() {
+    # Extract the human-readable title for the remote task.
+    # The full line text is the title; keys survive as literal text.
+    printf '%s' "$1"
+}
+
+extract_due() {
+    # Extract due:YYYY-MM-DD from a line
+    echo "$1" | grep -oE 'due:[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 | cut -d: -f2
+}
+
+extract_rem() {
+    # Extract rem:YYYY-MM-DDTHHMM from a line, expand to ISO 8601 for Graph
+    local rem
+    rem=$(echo "$1" | grep -oE 'rem:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{4}' | head -1 | cut -d: -f2-)
+    if [ -n "$rem" ]; then
+        local date time
+        date="${rem%T*}"
+        time="${rem#*T}"
+        printf '%sT%s:%s:00.0000000\n' "$date" "${time:0:2}" "${time:2:2}"
+    fi
+}
+
+extract_star() {
+    echo "$1" | grep -qE '(^| )star:1( |$)' && echo "high" || echo "normal"
+}
+
+is_completed() {
+    echo "$1" | grep -qE '^x '
+}
+
+build_patch_body() {
+    local LINE="$1"
+    local TITLE DUE REM IMPORTANCE STATUS BODY_PARTS
+
+    TITLE=$(line_to_title "$LINE")
+    DUE=$(extract_due "$LINE")
+    REM=$(extract_rem "$LINE")
+    IMPORTANCE=$(extract_star "$LINE")
+
+    if is_completed "$LINE"; then
+        STATUS='"status":"completed"'
+    else
+        STATUS='"status":"notStarted"'
+    fi
+
+    BODY_PARTS='"title":'"$(printf '%s' "$TITLE" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')"
+    BODY_PARTS="$BODY_PARTS,$STATUS"
+    BODY_PARTS="$BODY_PARTS,\"importance\":\"$IMPORTANCE\""
+
+    if [ -n "$DUE" ]; then
+        BODY_PARTS="$BODY_PARTS,\"dueDateTime\":{\"dateTime\":\"${DUE}T00:00:00.0000000\",\"timeZone\":\"UTC\"}"
+    fi
+    if [ -n "$REM" ]; then
+        BODY_PARTS="$BODY_PARTS,\"reminderDateTime\":{\"dateTime\":\"$REM\",\"timeZone\":\"UTC\"},\"isReminderOn\":true"
+    fi
+
+    printf '{%s}\n' "$BODY_PARTS"
+}
+
+# ── D10 threshold check ───────────────────────────────────────────────────────
+
+check_delete_threshold() {
+    local DELETE_COUNT="$1"
+    local TOTAL_COUNT="$2"
+
+    if [ "$FORCE_DELETE" -eq 1 ]; then
+        return 0
+    fi
+
+    local FRACTION_LIMIT
+    FRACTION_LIMIT=$(awk "BEGIN{printf \"%d\", $TOTAL_COUNT * $SYNC_DELETE_FRACTION}")
+
+    local LIMIT="$SYNC_DELETE_ABSOLUTE"
+    [ "$FRACTION_LIMIT" -lt "$LIMIT" ] && LIMIT="$FRACTION_LIMIT"
+
+    if [ "$DELETE_COUNT" -gt "$LIMIT" ]; then
+        echo "Sync aborted: $DELETE_COUNT deletions exceed threshold (max $SYNC_DELETE_ABSOLUTE or ${SYNC_DELETE_FRACTION} × $TOTAL_COUNT = $FRACTION_LIMIT)."
+        echo "Re-run with --force-delete to proceed, or --dry-run to review."
+        return 1
+    fi
+    return 0
+}
+
+# ── Map helpers ───────────────────────────────────────────────────────────────
+
+map_get() {
+    # map_get <local_id> <field>  — field: msft_id|hash|state
+    local LOCAL_ID="$1" FIELD="$2"
+    [ -f "$MAP_FILE" ] || return 1
+    local LINE
+    LINE=$(grep -E "^${LOCAL_ID}\t" "$MAP_FILE" | head -1) || true
+    [ -z "$LINE" ] && return 1
+    case "$FIELD" in
+        msft_id) echo "$LINE" | cut -f2 ;;
+        hash)    echo "$LINE" | cut -f3 ;;
+        state)   echo "$LINE" | cut -f4 ;;
+    esac
+}
+
+map_set() {
+    local LOCAL_ID="$1" MSFT_ID="$2" HASH="$3" STATE="$4"
+    mkdir -p "$(dirname "$MAP_FILE")"
+    # Remove existing row for this id
+    if [ -f "$MAP_FILE" ]; then
+        TMP=$(mktemp)
+        grep -vE "^${LOCAL_ID}\t" "$MAP_FILE" > "$TMP" || true
+        mv "$TMP" "$MAP_FILE"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$LOCAL_ID" "$MSFT_ID" "$HASH" "$STATE" >> "$MAP_FILE"
+}
+
+map_delete() {
+    local LOCAL_ID="$1"
+    [ -f "$MAP_FILE" ] || return 0
+    TMP=$(mktemp)
+    grep -vE "^${LOCAL_ID}\t" "$MAP_FILE" > "$TMP" || true
+    mv "$TMP" "$MAP_FILE"
+}
+
+# ── Local task enumeration ────────────────────────────────────────────────────
+
+local_tasks() {
+    # Emit: local_id <TAB> line
+    for FILE in "$TODO_FILE" "$DONE_FILE"; do
+        [ -f "$FILE" ] || continue
+        while IFS= read -r LINE || [ -n "$LINE" ]; do
+            [ -z "$LINE" ] && continue
+            LOCAL_ID=$(echo "$LINE" | grep -oE '(^| )id:[0-9]+' | grep -oE '[0-9]+' | head -1)
+            [ -n "$LOCAL_ID" ] && printf '%s\t%s\n' "$LOCAL_ID" "$LINE"
+        done < "$FILE"
+    done
+}
+
+# ── Status sub-command ────────────────────────────────────────────────────────
+
+do_status() {
+    echo "=== Local tasks with pending state ==="
+    [ -f "$MAP_FILE" ] || { echo "(no map file)"; return; }
+    grep $'\tnew\b' "$MAP_FILE" 2>/dev/null | awk -F'\t' '{print "  NEW   id:" $1}' || true
+    grep $'\tsynced\b' "$MAP_FILE" 2>/dev/null | while IFS=$'\t' read -r LID MID HASH _; do
+        LINE=$(grep -rh " id:${LID}\b" "$TODO_FILE" "$DONE_FILE" 2>/dev/null | head -1) || true
+        [ -z "$LINE" ] && echo "  DEL   id:${LID}" && continue
+        CURRENT=$(canonical_hash "$LINE")
+        [ "$CURRENT" != "$HASH" ] && echo "  MOD   id:${LID}: $LINE"
+    done || true
+    echo "(done)"
+}
+
+# ── Main reconciliation ───────────────────────────────────────────────────────
+
+do_sync() {
+    # Fetch delta from MS To Do
+    local DELTA_URL="/tasks/delta"
+    if [ -f "$DELTA_FILE" ]; then
+        DELTA_URL=$(cat "$DELTA_FILE")
+    fi
+
+    DELTA_RESP=$(graph_api GET "$DELTA_URL")
+
+    # Parse delta response with POSIX tools (no jq)
+    # We rely on line-by-line field extraction from the JSON response.
+    # This is brittle for complex JSON but sufficient for flat task objects.
+    DELTA_IDS=()
+    REMOVED_IDS=()
+    declare -A DELTA_TASKS  # msft_id -> title line
+
+    while IFS= read -r JLINE; do
+        case "$JLINE" in
+            *'"@odata.deltaLink"'*)
+                NEXT_DELTA=$(echo "$JLINE" | grep -oE '"@odata.deltaLink":"[^"]*"' | cut -d'"' -f4)
+                ;;
+            *'"@removed"'*)
+                IN_REMOVED=1
+                ;;
+            *'"id":'*)
+                MSFT_ID_RAW=$(echo "$JLINE" | grep -oE '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+                if [ "${IN_REMOVED:-0}" -eq 1 ]; then
+                    REMOVED_IDS+=("$MSFT_ID_RAW")
+                    IN_REMOVED=0
+                else
+                    CURRENT_MSFT_ID="$MSFT_ID_RAW"
+                fi
+                ;;
+            *'"title":'*)
+                TITLE=$(echo "$JLINE" | grep -oE '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+                [ -n "${CURRENT_MSFT_ID:-}" ] && DELTA_TASKS[$CURRENT_MSFT_ID]="$TITLE"
+                ;;
+        esac
+    done < <(echo "$DELTA_RESP" | tr ',' '\n')
+
+    # Save next delta link
+    [ -n "${NEXT_DELTA:-}" ] && printf '%s' "$NEXT_DELTA" > "$DELTA_FILE"
+
+    # Count local tasks for D10 threshold
+    TOTAL_LOCAL=$(local_tasks | wc -l | tr -d ' ')
+
+    # Build delete list
+    DELETE_LIST=()
+    [ -f "$MAP_FILE" ] || touch "$MAP_FILE"
+    while IFS=$'\t' read -r LOCAL_ID MSFT_ID LAST_HASH STATE; do
+        [ -z "$LOCAL_ID" ] && continue
+        # Check local presence
+        LOCAL_LINE=$(grep -rh " id:${LOCAL_ID}\b" "$TODO_FILE" "$DONE_FILE" 2>/dev/null | head -1) || true
+        if [ -z "$LOCAL_LINE" ]; then
+            # Task gone locally — check remote presence
+            if [ -n "${DELTA_TASKS[$MSFT_ID]+x}" ]; then
+                DELETE_LIST+=("$LOCAL_ID:$MSFT_ID")
+            fi
+        fi
+    done < "$MAP_FILE"
+
+    # D10 threshold check
+    if [ "${#DELETE_LIST[@]}" -gt 0 ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "Planned deletions (${#DELETE_LIST[@]}):"
+            for ENTRY in "${DELETE_LIST[@]}"; do
+                echo "  id:${ENTRY%%:*}"
+            done
+        else
+            check_delete_threshold "${#DELETE_LIST[@]}" "$TOTAL_LOCAL" || exit 2
+        fi
+    fi
+
+    # ── Execute operations ─────────────────────────────────────────────────
+    [ "$DRY_RUN" -eq 1 ] && echo "(dry-run — no changes made)" && return 0
+
+    # Process deletes
+    for ENTRY in "${DELETE_LIST[@]}"; do
+        LOCAL_ID="${ENTRY%%:*}"
+        MSFT_ID="${ENTRY#*:}"
+        graph_api DELETE "/tasks/$MSFT_ID" >/dev/null
+        map_delete "$LOCAL_ID"
+        echo "deleted remote id:$LOCAL_ID (msft:$MSFT_ID)"
+    done
+
+    # Process new local tasks
+    while IFS=$'\t' read -r LOCAL_ID LINE; do
+        MSFT_ID=$(map_get "$LOCAL_ID" msft_id 2>/dev/null) || MSFT_ID=""
+        if [ -z "$MSFT_ID" ]; then
+            BODY=$(build_patch_body "$LINE")
+            RESP=$(graph_api POST "/tasks" "$BODY")
+            NEW_MSFT_ID=$(echo "$RESP" | tr ',' '\n' | grep '"id"' | head -1 | cut -d'"' -f4)
+            HASH=$(canonical_hash "$LINE")
+            map_set "$LOCAL_ID" "$NEW_MSFT_ID" "$HASH" "synced"
+            echo "created remote id:$LOCAL_ID → msft:$NEW_MSFT_ID"
+        fi
+    done < <(local_tasks)
+
+    # Process synced tasks — hash comparison
+    while IFS=$'\t' read -r LOCAL_ID MSFT_ID LAST_HASH STATE; do
+        [ -z "$LOCAL_ID" ] || [ "$STATE" = "new" ] && continue
+        LOCAL_LINE=$(grep -rh " id:${LOCAL_ID}\b" "$TODO_FILE" "$DONE_FILE" 2>/dev/null | head -1) || true
+        [ -z "$LOCAL_LINE" ] && continue
+        CURRENT_HASH=$(canonical_hash "$LOCAL_LINE")
+        REMOTE_TITLE="${DELTA_TASKS[$MSFT_ID]+x}"
+
+        LOCAL_CHANGED=0
+        REMOTE_CHANGED=0
+        [ "$CURRENT_HASH" != "$LAST_HASH" ] && LOCAL_CHANGED=1
+        [ -n "${DELTA_TASKS[$MSFT_ID]+x}" ] && REMOTE_CHANGED=1
+
+        if [ "$LOCAL_CHANGED" -eq 1 ] && [ "$REMOTE_CHANGED" -eq 0 ]; then
+            BODY=$(build_patch_body "$LOCAL_LINE")
+            graph_api PATCH "/tasks/$MSFT_ID" "$BODY" >/dev/null
+            map_set "$LOCAL_ID" "$MSFT_ID" "$CURRENT_HASH" "synced"
+            echo "pushed id:$LOCAL_ID"
+        elif [ "$LOCAL_CHANGED" -eq 0 ] && [ "$REMOTE_CHANGED" -eq 1 ]; then
+            echo "pull id:$LOCAL_ID — not yet implemented (update local line from remote title)"
+        elif [ "$LOCAL_CHANGED" -eq 1 ] && [ "$REMOTE_CHANGED" -eq 1 ]; then
+            # Conflict: local wins; save remote to conflicts/
+            mkdir -p "$CONFLICT_DIR"
+            TS=$(date +%Y%m%dT%H%M%S)
+            CONFLICT_FILE="$CONFLICT_DIR/${LOCAL_ID}-${TS}.txt"
+            {
+                echo "REMOTE at ${TS}:"
+                echo "  ${DELTA_TASKS[$MSFT_ID]:-unknown}"
+                echo "LOCAL at ${TS} (kept):"
+                echo "  $LOCAL_LINE"
+            } > "$CONFLICT_FILE"
+            BODY=$(build_patch_body "$LOCAL_LINE")
+            graph_api PATCH "/tasks/$MSFT_ID" "$BODY" >/dev/null
+            map_set "$LOCAL_ID" "$MSFT_ID" "$CURRENT_HASH" "synced"
+            echo "conflict id:$LOCAL_ID — local wins; remote saved to $CONFLICT_FILE"
+        fi
+    done < "$MAP_FILE"
+
+    echo "sync complete"
+}
+
+# ── Sub-command dispatch ──────────────────────────────────────────────────────
+
+case "$SUB_CMD" in
+    push)   do_sync ;;
+    pull)   do_sync ;;
+    status) do_status ;;
+    "")     do_sync ;;
+    *)      echo "sync: unknown sub-command '$SUB_CMD'" >&2; usage >&2; exit 1 ;;
+esac

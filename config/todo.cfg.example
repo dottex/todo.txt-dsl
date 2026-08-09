@@ -1,0 +1,92 @@
+# todo.txt DSL — example configuration
+# Source this from ~/.todo/config or point TODO_CFG at it.
+# todo.sh sources its config as shell, so all values here are valid shell.
+#
+# Quick start:
+#   cp config/todo.cfg.example ~/.todo/config
+#   # Edit the paths below to match your setup
+#   export TODO_ACTIONS_DIR=~/.todo/actions
+#   cp addons/* ~/.todo/actions/
+#   chmod +x ~/.todo/actions/*
+
+# ── List selection ────────────────────────────────────────────────────────────
+# Switch between lists by setting TODO_LIST before invoking todo.sh.
+# Default: logbook (the single synced list).
+#
+#   TODO_LIST=inbox todo.sh ls
+#   TODO_LIST=logbook todo.sh ls
+#
+export TODO_DIR="${HOME}/.todo/${TODO_LIST:-logbook}"
+
+# ── Core file paths ───────────────────────────────────────────────────────────
+export TODO_FILE="${TODO_DIR}/todo.txt"
+export DONE_FILE="${TODO_DIR}/done.txt"
+export REPORT_FILE="${TODO_DIR}/report.txt"
+
+# ── Addon directory ───────────────────────────────────────────────────────────
+# Place the addons/ scripts from this repository here.
+export TODO_ACTIONS_DIR="${HOME}/.todo/actions"
+
+# ── Date handling ─────────────────────────────────────────────────────────────
+# Set to 1 to prepend a creation date on every add/capture.
+# Mirrors todo.sh's native DATE_ON_ADD behaviour.
+export DATE_ON_ADD=1
+
+# ── Display ──────────────────────────────────────────────────────────────────
+# Colour scheme — see todo.sh documentation for colour codes.
+# export PRI_A='\033[0;33m'   # yellow
+# export PRI_B='\033[0;36m'   # cyan
+# export PRI_C='\033[0;34m'   # blue
+
+# ── Sync thresholds (D10) ─────────────────────────────────────────────────────
+# Abort sync if more than this many tasks would be deleted in one run.
+# Both limits are checked; whichever triggers first wins.
+export SYNC_DELETE_ABSOLUTE=10
+export SYNC_DELETE_FRACTION=0.20
+
+# ── Useful aliases ───────────────────────────────────────────────────────────
+# Paste these into your shell rc file, or source this file from it.
+
+# Today's My Day list (tasks with myday:YYYY-MM-DD matching today).
+# alias myday='grep "myday:$(date +%F)" "${TODO_FILE}" 2>/dev/null'
+
+# Next actions.
+# alias next='grep " s:next" "${TODO_FILE}" 2>/dev/null'
+
+# Someday/Maybe list.
+# alias someday='grep " s:someday" "${TODO_FILE}" 2>/dev/null'
+
+# Tasks waiting on someone.
+# alias waiting='grep " s:wait" "${TODO_FILE}" 2>/dev/null'
+
+# Overdue tasks (requires GNU date).
+# alias overdue='grep -E " due:[0-9]{4}-[0-9]{2}-[0-9]{2}" "${TODO_FILE}" | \
+#   awk -v today="$(date +%F)" '"'"'match($0, /due:([0-9-]+)/, a) && a[1] < today'"'"''
+
+# ── Directory layout ─────────────────────────────────────────────────────────
+# Expected structure under ~/.todo/ :
+#
+#   ~/.todo/
+#     .idseq                      # global monotonic ID counter
+#     logbook/
+#       todo.txt                  # the single synced list
+#       done.txt                  # archived tasks (still searchable by resolve)
+#       .list-meta                # provider list ID, display name
+#       .sync/
+#         map.tsv                 # local_id  msft_id  last_hash  state
+#         delta.link              # @odata.deltaLink from last sync
+#     inbox/
+#       todo.txt                  # local capture inbox (not synced)
+#       done.txt
+#     <other local lists>/
+#       todo.txt
+#       done.txt
+#
+# Credentials (never under ~/.todo/):
+#   ~/.config/todo-sync/credentials  (mode 0600)
+#     MSFT_CLIENT_ID=...
+#     MSFT_CLIENT_SECRET=...
+#     MSFT_ACCESS_TOKEN=...
+#     MSFT_REFRESH_TOKEN=...
+#     MSFT_TOKEN_EXPIRY=...        # Unix timestamp
+#     MSFT_LIST_ID=...             # Microsoft To Do list GUID
